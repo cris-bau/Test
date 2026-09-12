@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Prototipo: Audio AR posicionado (WebXR)</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: system-ui, sans-serif; }
+  canvas { display: block; }
+
+  /* Overlay de UI: se muestra por encima de la cámara real gracias a "dom-overlay" */
+  #overlay {
+    position: fixed; inset: 0; pointer-events: none;
+    display: flex; flex-direction: column; justify-content: space-between;
+  }
+  #topbar {
+    pointer-events: auto;
+    margin: 12px; padding: 10px 14px;
+    background: rgba(0,0,0,0.55); color: #fff; border-radius: 10px;
+    font-size: 14px; line-height: 1.4;
+  }
+  #bottombar {
+    pointer-events: auto;
+    margin: 16px; display: flex; gap: 10px; justify-content: center;
+  }
+  button {
+    pointer-events: auto;
+    background: #fff; color: #111; border: none; border-radius: 999px;
+    padding: 10px 18px; font-size: 14px; font-weight: 600;
+  }
+  button:active { transform: scale(0.97); }
+
+  /* Pantalla previa a entrar en AR (o de error si el dispositivo no soporta WebXR) */
+  #intro {
+    position: fixed; inset: 0; background: #0b0b10; color: #fff;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; padding: 24px; gap: 14px;
+  }
+  #intro h1 { font-size: 18px; margin: 0; }
+  #intro p { font-size: 14px; opacity: 0.8; max-width: 320px; line-height: 1.5; margin: 0; }
+  #arBtnContainer button {
+    padding: 14px 28px; font-size: 16px;
+  }
+</style>
+</head>
+<body>
+
+<div id="intro">
+  <h1>Prototipo de audio posicionado en RA</h1>
+  <p>Toca la pantalla para colocar una fuente de sonido en el espacio real. Camina alrededor y escúchala con auriculares: el volumen y el ángulo cambian según tu posición y hacia dónde miras.</p>
+  <p id="supportMsg">Comprobando soporte de WebXR…</p>
+  <div id="arBtnContainer"></div>
+</div>
+
+<div id="overlay" style="display:none">
+  <div id="topbar">
+    Sonidos colocados: <span id="count">0</span><br/>
+    Toca una superficie detectada para agregar otro sonido.
+  </div>
+  <div id="bottombar">
+    <button id="resetBtn">Limpiar todo</button>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+/* ---------------------------------------------------------------------
+   1) CONFIGURACIÓN BÁSICA DE THREE.JS + WEBXR
+   --------------------------------------------------------------------- */
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 40);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+const light = new THREE.HemisphereLight(0xffffff, 0x444444, 1.2);
+scene.add(light);
+
+// Retícula: aro que muestra dónde se colocaría el sonido antes de tocar
+const reticleGeo = new THREE.RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI / 2);
+const reticleMat = new THREE.MeshBasicMaterial({ color: 0x00e5ff });
+const reticle = new THREE.Mesh(reticleGeo, reticleMat);
+reticle.matrixAutoUpdate = false;
+reticle.visible = false;
+scene.add(reticle);
+
+let hitTestSource = null;
+let hitTestSourceRequested = false;
+let localSpace = null;
+
+/* ---------------------------------------------------------------------
+   2) WEB AUDIO: contexto, listener y fuentes con panning HRTF
+   --------------------------------------------------------------------- */
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+const masterGain = audioCtx.createGain();
+masterGain.gain.value = 0.9;
+masterGain.connect(audioCtx.destination);
+
+const placedSounds = []; // { osc, panner, gain, mesh }
+const noteFrequencies = [261.6, 329.6, 392.0, 440.0, 523.3, 659.3]; // notas para distinguir cada fuente por oído
+
+function addSoundSource(position) {
+  // Oscilador simple como "sonido" de la fuente (podés reemplazar esto por un audio real
+  // usando audioCtx.createBufferSource() + un archivo cargado con fetch/decodeAudioData)
+  const osc = audioCtx.createOscillator();
+  osc.type = 'sine';
+  osc.frequency.value = noteFrequencies[placedSounds.length % noteFrequencies.length];
+
+  const gain = audioCtx.createGain();
+  gain.gain.value = 0.35;
+
+  const panner = audioCtx.createPanner();
+  panner.panningModel = 'HRTF';        // <- esto es lo que da la sensación binaural realista
+  panner.distanceModel = 'inverse';
+  panner.refDistance = 0.6;
+  panner.maxDistance = 15;
+  panner.rolloffFactor = 1.4;
+  panner.coneInnerAngle = 360;         // fuente omnidireccional (suena igual desde cualquier lado)
+  setPannerPosition(panner, position);
+
+  osc.connect(gain).connect(panner).connect(masterGain);
+  osc.start();
+
+  // Marcador visual (solo para poder ver dónde quedó cada fuente durante la prueba)
+  const hue = (placedSounds.length * 65) % 360;
+  const mesh = new THREE.Mesh(
+    new THREE.SphereGeometry(0.045, 20, 20),
+    new THREE.MeshStandardMaterial({ color: new THREE.Color(`hsl(${hue},85%,55%)`), emissive: new THREE.Color(`hsl(${hue},85%,25%)`) })
+  );
+  mesh.position.copy(position);
+  scene.add(mesh);
+
+  placedSounds.push({ osc, panner, gain, mesh });
+  document.getElementById('count').textContent = placedSounds.length;
+}
+
+function setPannerPosition(panner, pos) {
+  if (panner.positionX) {
+    panner.positionX.value = pos.x;
+    panner.positionY.value = pos.y;
+    panner.positionZ.value = pos.z;
+  } else {
+    panner.setPosition(pos.x, pos.y, pos.z); // fallback para navegadores viejos
+  }
+}
+
+function clearAllSounds() {
+  placedSounds.forEach(s => {
+    s.osc.stop();
+    scene.remove(s.mesh);
+  });
+  placedSounds.length = 0;
+  document.getElementById('count').textContent = 0;
+}
+
+// Actualiza la posición/orientación del "oyente" según la pose real de la cámara del teléfono
+function updateListener() {
+  const xrCam = renderer.xr.getCamera(camera);
+  xrCam.updateMatrixWorld();
+  const pos = new THREE.Vector3().setFromMatrixPosition(xrCam.matrixWorld);
+  const quat = new THREE.Quaternion().setFromRotationMatrix(xrCam.matrixWorld);
+  const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(quat);
+  const up = new THREE.Vector3(0, 1, 0).applyQuaternion(quat);
+
+  const listener = audioCtx.listener;
+  if (listener.positionX) {
+    listener.positionX.value = pos.x; listener.positionY.value = pos.y; listener.positionZ.value = pos.z;
+    listener.forwardX.value = forward.x; listener.forwardY.value = forward.y; listener.forwardZ.value = forward.z;
+    listener.upX.value = up.x; listener.upY.value = up.y; listener.upZ.value = up.z;
+  } else {
+    listener.setPosition(pos.x, pos.y, pos.z);
+    listener.setOrientation(forward.x, forward.y, forward.z, up.x, up.y, up.z);
+  }
+}
+
+/* ---------------------------------------------------------------------
+   3) ENTRADA A LA SESIÓN AR (hit-test + dom-overlay)
+   --------------------------------------------------------------------- */
+const supportMsg = document.getElementById('supportMsg');
+
+if (navigator.xr) {
+  navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
+    if (supported) {
+      supportMsg.textContent = 'Listo. Usá auriculares para escuchar el efecto 3D del audio.';
+      buildARButton();
+    } else {
+      supportMsg.textContent = 'Este dispositivo/navegador no soporta AR inmersiva (immersive-ar). Probá con Chrome en un Android compatible con ARCore.';
+    }
+  });
+} else {
+  supportMsg.textContent = 'WebXR no está disponible en este navegador. Probá con Chrome en Android.';
+}
+
+function buildARButton() {
+  const btn = ARButton.createButton(renderer, {
+    requiredFeatures: ['hit-test'],
+    optionalFeatures: ['dom-overlay', 'local-floor'],
+    domOverlay: { root: document.body }
+  });
+  document.getElementById('arBtnContainer').appendChild(btn);
+}
+
+document.getElementById('resetBtn').addEventListener('click', clearAllSounds);
+
+renderer.xr.addEventListener('sessionstart', async () => {
+  document.getElementById('intro').style.display = 'none';
+  document.getElementById('overlay').style.display = 'flex';
+  await audioCtx.resume(); // los navegadores exigen resumir el audio tras una interacción del usuario
+
+  const session = renderer.xr.getSession();
+  const viewerSpace = await session.requestReferenceSpace('viewer');
+  hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+  localSpace = renderer.xr.getReferenceSpace();
+  hitTestSourceRequested = true;
+});
+
+renderer.xr.addEventListener('sessionend', () => {
+  hitTestSource = null;
+  hitTestSourceRequested = false;
+  document.getElementById('intro').style.display = 'flex';
+  document.getElementById('overlay').style.display = 'none';
+});
+
+// Al tocar la pantalla mientras la retícula está visible, coloca una fuente de sonido ahí
+const controller = renderer.xr.getController(0);
+controller.addEventListener('select', () => {
+  if (reticle.visible) {
+    const pos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+    addSoundSource(pos);
+  }
+});
+scene.add(controller);
+
+/* ---------------------------------------------------------------------
+   4) BUCLE DE RENDER
+   --------------------------------------------------------------------- */
+renderer.setAnimationLoop((timestamp, frame) => {
+  if (frame && hitTestSourceRequested && hitTestSource) {
+    const hitTestResults = frame.getHitTestResults(hitTestSource);
+    if (hitTestResults.length > 0) {
+      const pose = hitTestResults[0].getPose(localSpace);
+      reticle.visible = true;
+      reticle.matrix.fromArray(pose.transform.matrix);
+    } else {
+      reticle.visible = false;
+    }
+  }
+  if (frame) updateListener();
+  renderer.render(scene, camera);
+});
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
