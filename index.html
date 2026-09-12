@@ -8,7 +8,6 @@
   html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: system-ui, sans-serif; }
   canvas { display: block; }
 
-  /* Overlay de UI: se muestra por encima de la cámara real gracias a "dom-overlay" */
   #overlay {
     position: fixed; inset: 0; pointer-events: none;
     display: flex; flex-direction: column; justify-content: space-between;
@@ -17,8 +16,36 @@
     pointer-events: auto;
     margin: 12px; padding: 10px 14px;
     background: rgba(0,0,0,0.55); color: #fff; border-radius: 10px;
-    font-size: 14px; line-height: 1.4;
+    font-size: 13px; line-height: 1.4;
   }
+
+  /* Panel de fuentes colocadas, con sliders de volumen por capa */
+  #soundPanel {
+    pointer-events: auto;
+    align-self: flex-end;
+    margin: 0 12px 12px auto;
+    width: 230px; max-height: 42vh; overflow-y: auto;
+    background: rgba(0,0,0,0.55); border-radius: 12px; padding: 8px;
+  }
+  #soundPanel:empty { display: none; }
+  .soundItem {
+    background: rgba(255,255,255,0.08); border-radius: 8px;
+    padding: 8px 10px; margin-bottom: 8px; color: #fff;
+  }
+  .soundItem:last-child { margin-bottom: 0; }
+  .soundItem .row1 {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 12px; font-weight: 600; margin-bottom: 6px;
+  }
+  .soundItem .row1 button {
+    background: rgba(255,255,255,0.18); color: #fff; border: none;
+    border-radius: 999px; width: 22px; height: 22px; font-size: 12px; padding: 0; line-height: 1;
+  }
+  .soundItem label {
+    display: block; font-size: 11px; opacity: 0.85; margin-top: 4px;
+  }
+  .soundItem input[type="range"] { width: 100%; }
+
   #bottombar {
     pointer-events: auto;
     margin: 16px; display: flex; gap: 10px; justify-content: center;
@@ -30,7 +57,6 @@
   }
   button:active { transform: scale(0.97); }
 
-  /* Pantalla previa a entrar en AR (o de error si el dispositivo no soporta WebXR) */
   #intro {
     position: fixed; inset: 0; background: #0b0b10; color: #fff;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -38,16 +64,14 @@
   }
   #intro h1 { font-size: 18px; margin: 0; }
   #intro p { font-size: 14px; opacity: 0.8; max-width: 320px; line-height: 1.5; margin: 0; }
-  #arBtnContainer button {
-    padding: 14px 28px; font-size: 16px;
-  }
+  #arBtnContainer button { padding: 14px 28px; font-size: 16px; }
 </style>
 </head>
 <body>
 
 <div id="intro">
   <h1>Prototipo de audio posicionado en RA</h1>
-  <p>Toca la pantalla para colocar una fuente de sonido en el espacio real. Camina alrededor y escúchala con auriculares: el volumen y el ángulo cambian según tu posición y hacia dónde miras.</p>
+  <p>Toca la pantalla para colocar una fuente de sonido en el espacio real. Cada fuente reproduce dos capas a la vez: un sonido principal y un sonido de fondo más bajo. Usá auriculares para escuchar el efecto 3D.</p>
   <p id="supportMsg">Comprobando soporte de WebXR…</p>
   <div id="arBtnContainer"></div>
 </div>
@@ -55,8 +79,9 @@
 <div id="overlay" style="display:none">
   <div id="topbar">
     Sonidos colocados: <span id="count">0</span><br/>
-    Toca una superficie detectada para agregar otro sonido.
+    Toca una superficie detectada para agregar otro.
   </div>
+  <div id="soundPanel"></div>
   <div id="bottombar">
     <button id="resetBtn">Limpiar todo</button>
   </div>
@@ -76,7 +101,15 @@ import * as THREE from 'three';
 import { ARButton } from 'three/addons/webxr/ARButton.js';
 
 /* ---------------------------------------------------------------------
-   1) CONFIGURACIÓN BÁSICA DE THREE.JS + WEBXR
+   0) CONFIGURACIÓN DE AUDIO: poné acá las URLs de tus archivos reales.
+      Si las dejás en null, se usa un sonido generado (tono + ruido filtrado)
+      para que el prototipo funcione sin necesitar archivos.
+   --------------------------------------------------------------------- */
+const PRIMARY_SOUND_URL = audio.mp3;    // ej: './audio/narracion.mp3'
+const BACKGROUND_SOUND_URL = Aymara.mp3; // ej: './audio/ambiente.mp3'
+
+/* ---------------------------------------------------------------------
+   1) THREE.JS + WEBXR
    --------------------------------------------------------------------- */
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 40);
@@ -87,10 +120,8 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.xr.enabled = true;
 document.body.appendChild(renderer.domElement);
 
-const light = new THREE.HemisphereLight(0xffffff, 0x444444, 1.2);
-scene.add(light);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.2));
 
-// Retícula: aro que muestra dónde se colocaría el sonido antes de tocar
 const reticleGeo = new THREE.RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI / 2);
 const reticleMat = new THREE.MeshBasicMaterial({ color: 0x00e5ff });
 const reticle = new THREE.Mesh(reticleGeo, reticleMat);
@@ -103,50 +134,47 @@ let hitTestSourceRequested = false;
 let localSpace = null;
 
 /* ---------------------------------------------------------------------
-   2) WEB AUDIO: contexto, listener y fuentes con panning HRTF
+   2) WEB AUDIO: contexto, listener, y buffers de las dos capas de sonido
    --------------------------------------------------------------------- */
 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 const masterGain = audioCtx.createGain();
 masterGain.gain.value = 0.9;
 masterGain.connect(audioCtx.destination);
 
-const placedSounds = []; // { osc, panner, gain, mesh }
-const noteFrequencies = [261.6, 329.6, 392.0, 440.0, 523.3, 659.3]; // notas para distinguir cada fuente por oído
+let primaryBuffer = null;    // se llena si PRIMARY_SOUND_URL está configurado
+let backgroundBuffer = null; // se llena si BACKGROUND_SOUND_URL está configurado
+let ambientNoiseBuffer = null; // fallback generado si no hay BACKGROUND_SOUND_URL
 
-function addSoundSource(position) {
-  // Oscilador simple como "sonido" de la fuente (podés reemplazar esto por un audio real
-  // usando audioCtx.createBufferSource() + un archivo cargado con fetch/decodeAudioData)
-  const osc = audioCtx.createOscillator();
-  osc.type = 'sine';
-  osc.frequency.value = noteFrequencies[placedSounds.length % noteFrequencies.length];
-
-  const gain = audioCtx.createGain();
-  gain.gain.value = 0.35;
-
-  const panner = audioCtx.createPanner();
-  panner.panningModel = 'HRTF';        // <- esto es lo que da la sensación binaural realista
-  panner.distanceModel = 'inverse';
-  panner.refDistance = 0.6;
-  panner.maxDistance = 15;
-  panner.rolloffFactor = 1.4;
-  panner.coneInnerAngle = 360;         // fuente omnidireccional (suena igual desde cualquier lado)
-  setPannerPosition(panner, position);
-
-  osc.connect(gain).connect(panner).connect(masterGain);
-  osc.start();
-
-  // Marcador visual (solo para poder ver dónde quedó cada fuente durante la prueba)
-  const hue = (placedSounds.length * 65) % 360;
-  const mesh = new THREE.Mesh(
-    new THREE.SphereGeometry(0.045, 20, 20),
-    new THREE.MeshStandardMaterial({ color: new THREE.Color(`hsl(${hue},85%,55%)`), emissive: new THREE.Color(`hsl(${hue},85%,25%)`) })
-  );
-  mesh.position.copy(position);
-  scene.add(mesh);
-
-  placedSounds.push({ osc, panner, gain, mesh });
-  document.getElementById('count').textContent = placedSounds.length;
+async function loadAudioBuffer(url) {
+  const res = await fetch(url);
+  const arr = await res.arrayBuffer();
+  return audioCtx.decodeAudioData(arr);
 }
+
+// Genera un ruido suave y filtrado para usar como "fondo" de reemplazo si no se
+// configuró un archivo real. Reemplazalo por tu propio audio ambiente cuando quieras.
+function createAmbientNoiseBuffer(durationSec = 2) {
+  const rate = audioCtx.sampleRate;
+  const buffer = audioCtx.createBuffer(1, rate * durationSec, rate);
+  const data = buffer.getChannelData(0);
+  let last = 0;
+  for (let i = 0; i < data.length; i++) {
+    const white = Math.random() * 2 - 1;
+    last = (last + 0.02 * white) / 1.02; // suaviza el ruido blanco (más "hum" que estática)
+    data[i] = last * 3.5;
+  }
+  return buffer;
+}
+
+async function preloadBuffers() {
+  ambientNoiseBuffer = createAmbientNoiseBuffer();
+  if (PRIMARY_SOUND_URL) primaryBuffer = await loadAudioBuffer(PRIMARY_SOUND_URL);
+  if (BACKGROUND_SOUND_URL) backgroundBuffer = await loadAudioBuffer(BACKGROUND_SOUND_URL);
+}
+
+const placedSounds = []; // { primaryGain, backgroundGain, nodes:[...], mesh, id }
+const noteFrequencies = [261.6, 329.6, 392.0, 440.0, 523.3, 659.3];
+let nextId = 1;
 
 function setPannerPosition(panner, pos) {
   if (panner.positionX) {
@@ -154,20 +182,136 @@ function setPannerPosition(panner, pos) {
     panner.positionY.value = pos.y;
     panner.positionZ.value = pos.z;
   } else {
-    panner.setPosition(pos.x, pos.y, pos.z); // fallback para navegadores viejos
+    panner.setPosition(pos.x, pos.y, pos.z);
   }
 }
 
-function clearAllSounds() {
-  placedSounds.forEach(s => {
-    s.osc.stop();
-    scene.remove(s.mesh);
-  });
-  placedSounds.length = 0;
-  document.getElementById('count').textContent = 0;
+function addSoundSource(position) {
+  const id = nextId++;
+  const nodesToStop = [];
+
+  // Panner único: ambas capas suenan desde el mismo punto del espacio
+  const panner = audioCtx.createPanner();
+  panner.panningModel = 'HRTF';
+  panner.distanceModel = 'inverse';
+  panner.refDistance = 0.6;
+  panner.maxDistance = 15;
+  panner.rolloffFactor = 1.4;
+  panner.coneInnerAngle = 360;
+  setPannerPosition(panner, position);
+  panner.connect(masterGain);
+
+  // --- Capa principal ---
+  const primaryGain = audioCtx.createGain();
+  primaryGain.gain.value = 0.7; // valor inicial del slider "Principal"
+  primaryGain.connect(panner);
+
+  let primarySource;
+  if (primaryBuffer) {
+    primarySource = audioCtx.createBufferSource();
+    primarySource.buffer = primaryBuffer;
+    primarySource.loop = true;
+  } else {
+    primarySource = audioCtx.createOscillator(); // fallback: tono simple
+    primarySource.type = 'sine';
+    primarySource.frequency.value = noteFrequencies[(id - 1) % noteFrequencies.length];
+  }
+  primarySource.connect(primaryGain);
+  primarySource.start();
+  nodesToStop.push(primarySource);
+
+  // --- Capa de fondo (más baja, en loop) ---
+  const backgroundGain = audioCtx.createGain();
+  backgroundGain.gain.value = 0.25; // valor inicial del slider "Fondo", más bajo que el principal
+
+  let backgroundSource;
+  if (backgroundBuffer) {
+    backgroundSource = audioCtx.createBufferSource();
+    backgroundSource.buffer = backgroundBuffer;
+    backgroundSource.loop = true;
+    backgroundSource.connect(backgroundGain);
+  } else {
+    backgroundSource = audioCtx.createBufferSource();
+    backgroundSource.buffer = ambientNoiseBuffer;
+    backgroundSource.loop = true;
+    const lowpass = audioCtx.createBiquadFilter();
+    lowpass.type = 'lowpass';
+    lowpass.frequency.value = 900;
+    backgroundSource.connect(lowpass).connect(backgroundGain);
+  }
+  backgroundGain.connect(panner);
+  backgroundSource.start();
+  nodesToStop.push(backgroundSource);
+
+  // Marcador visual
+  const hue = (id * 65) % 360;
+  const mesh = new THREE.Mesh(
+    new THREE.SphereGeometry(0.045, 20, 20),
+    new THREE.MeshStandardMaterial({ color: new THREE.Color(`hsl(${hue},85%,55%)`), emissive: new THREE.Color(`hsl(${hue},85%,25%)`) })
+  );
+  mesh.position.copy(position);
+  scene.add(mesh);
+
+  const entry = { id, primaryGain, backgroundGain, nodesToStop, mesh };
+  placedSounds.push(entry);
+  renderSoundPanel();
 }
 
-// Actualiza la posición/orientación del "oyente" según la pose real de la cámara del teléfono
+function removeSoundSource(id) {
+  const idx = placedSounds.findIndex(s => s.id === id);
+  if (idx === -1) return;
+  const entry = placedSounds[idx];
+  entry.nodesToStop.forEach(n => { try { n.stop(); } catch (e) {} });
+  scene.remove(entry.mesh);
+  placedSounds.splice(idx, 1);
+  renderSoundPanel();
+}
+
+function clearAllSounds() {
+  [...placedSounds].forEach(s => removeSoundSource(s.id));
+}
+
+// Redibuja la lista de fuentes con sus sliders de volumen (principal / fondo)
+function renderSoundPanel() {
+  const panel = document.getElementById('soundPanel');
+  panel.innerHTML = '';
+  placedSounds.forEach((s, i) => {
+    const item = document.createElement('div');
+    item.className = 'soundItem';
+    item.innerHTML = `
+      <div class="row1">
+        <span>Fuente ${i + 1}</span>
+        <button data-id="${s.id}" class="removeBtn">×</button>
+      </div>
+      <label>Principal
+        <input type="range" min="0" max="100" value="${Math.round(s.primaryGain.gain.value * 100)}" class="volPrimary" data-id="${s.id}">
+      </label>
+      <label>Fondo
+        <input type="range" min="0" max="100" value="${Math.round(s.backgroundGain.gain.value * 100)}" class="volBg" data-id="${s.id}">
+      </label>
+    `;
+    panel.appendChild(item);
+  });
+
+  panel.querySelectorAll('.volPrimary').forEach(input => {
+    input.addEventListener('input', (e) => {
+      const entry = placedSounds.find(s => s.id == e.target.dataset.id);
+      if (entry) entry.primaryGain.gain.value = e.target.value / 100;
+    });
+  });
+  panel.querySelectorAll('.volBg').forEach(input => {
+    input.addEventListener('input', (e) => {
+      const entry = placedSounds.find(s => s.id == e.target.dataset.id);
+      if (entry) entry.backgroundGain.gain.value = e.target.value / 100;
+    });
+  });
+  panel.querySelectorAll('.removeBtn').forEach(btn => {
+    btn.addEventListener('click', (e) => removeSoundSource(Number(e.target.dataset.id)));
+  });
+
+  document.getElementById('count').textContent = placedSounds.length;
+}
+
 function updateListener() {
   const xrCam = renderer.xr.getCamera(camera);
   xrCam.updateMatrixWorld();
@@ -188,7 +332,7 @@ function updateListener() {
 }
 
 /* ---------------------------------------------------------------------
-   3) ENTRADA A LA SESIÓN AR (hit-test + dom-overlay)
+   3) ENTRADA A LA SESIÓN AR
    --------------------------------------------------------------------- */
 const supportMsg = document.getElementById('supportMsg');
 
@@ -219,7 +363,8 @@ document.getElementById('resetBtn').addEventListener('click', clearAllSounds);
 renderer.xr.addEventListener('sessionstart', async () => {
   document.getElementById('intro').style.display = 'none';
   document.getElementById('overlay').style.display = 'flex';
-  await audioCtx.resume(); // los navegadores exigen resumir el audio tras una interacción del usuario
+  await audioCtx.resume();
+  await preloadBuffers();
 
   const session = renderer.xr.getSession();
   const viewerSpace = await session.requestReferenceSpace('viewer');
@@ -235,7 +380,6 @@ renderer.xr.addEventListener('sessionend', () => {
   document.getElementById('overlay').style.display = 'none';
 });
 
-// Al tocar la pantalla mientras la retícula está visible, coloca una fuente de sonido ahí
 const controller = renderer.xr.getController(0);
 controller.addEventListener('select', () => {
   if (reticle.visible) {
