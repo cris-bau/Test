@@ -18,6 +18,10 @@
     background: rgba(0,0,0,0.55); color: #fff; border-radius: 10px;
     font-size: 13px; line-height: 1.4;
   }
+  #debugMsg {
+    display: none; margin-top: 6px; color: #ffb3b3; font-size: 12px;
+    background: rgba(120,0,0,0.35); border-radius: 6px; padding: 6px 8px;
+  }
 
   /* Panel de fuentes colocadas, con sliders de volumen por capa */
   #soundPanel {
@@ -65,6 +69,15 @@
   #intro h1 { font-size: 18px; margin: 0; }
   #intro p { font-size: 14px; opacity: 0.8; max-width: 320px; line-height: 1.5; margin: 0; }
   #arBtnContainer button { padding: 14px 28px; font-size: 16px; }
+
+  /* Panel de diagnóstico: útil para ver errores directo en el celular sin consola */
+  #debugLog {
+    margin-top: 10px; max-width: 320px; max-height: 30vh; overflow-y: auto;
+    background: rgba(255,255,255,0.06); border-radius: 8px; padding: 8px;
+    font-family: monospace; font-size: 11px; text-align: left; white-space: pre-wrap;
+    color: #9fe870;
+  }
+  #debugLog:empty { display: none; }
 </style>
 </head>
 <body>
@@ -74,12 +87,28 @@
   <p>Toca la pantalla para colocar una fuente de sonido en el espacio real. Cada fuente reproduce dos capas a la vez: un sonido principal y un sonido de fondo más bajo. Usá auriculares para escuchar el efecto 3D.</p>
   <p id="supportMsg">Comprobando soporte de WebXR…</p>
   <div id="arBtnContainer"></div>
+  <div id="debugLog"></div>
 </div>
+
+<script>
+  // Este script NO es un módulo, así que corre incluso si el <script type="module">
+  // de más abajo no llega a ejecutarse (ej. por abrir el archivo con file:// en vez
+  // de http(s)://). Si en unos segundos el mensaje de soporte no cambió, es la pista
+  // más clara de que el problema es cómo se abrió el archivo, no el código en sí.
+  setTimeout(() => {
+    const msg = document.getElementById('supportMsg');
+    if (msg && msg.textContent.includes('Comprobando')) {
+      msg.textContent = 'El script no llegó a ejecutarse. Lo más probable es que abriste este archivo con doble clic (file://) en vez de servirlo por http(s)://. Corré por ejemplo "python3 -m http.server" en la carpeta y abrí http://localhost:8000/ este archivo.';
+      msg.style.color = '#ff8a80';
+    }
+  }, 4000);
+</script>
 
 <div id="overlay" style="display:none">
   <div id="topbar">
     Sonidos colocados: <span id="count">0</span><br/>
     Toca una superficie detectada para agregar otro.
+    <div id="debugMsg"></div>
   </div>
   <div id="soundPanel"></div>
   <div id="bottombar">
@@ -105,8 +134,20 @@ import { ARButton } from 'three/addons/webxr/ARButton.js';
       Si las dejás en null, se usa un sonido generado (tono + ruido filtrado)
       para que el prototipo funcione sin necesitar archivos.
    --------------------------------------------------------------------- */
-const PRIMARY_SOUND_URL = 'audio.mp3';
-const BACKGROUND_SOUND_URL = 'Aymara.mp3';
+const PRIMARY_SOUND_URL = 'audio.mp3';    // ej: './audio.mp3'
+const BACKGROUND_SOUND_URL = 'Aymara.mp3'; // ej: './Aymara.mp3'  (respetá mayúsculas/minúsculas exactas del archivo)
+
+// Log visible en pantalla (además de en la consola) para depurar sin herramientas extra.
+function log(msg) {
+  console.log(msg);
+  const el = document.getElementById('debugLog'); // visible en la pantalla de inicio, antes de entrar en AR
+  if (el) el.textContent += msg + '\n';
+  const d = document.getElementById('debugMsg');  // visible dentro de la sesión AR (ej. errores al cargar audio)
+  if (d) { d.textContent = msg; d.style.display = 'block'; }
+}
+window.addEventListener('error', (e) => log('Error: ' + e.message));
+window.addEventListener('unhandledrejection', (e) => log('Promesa rechazada: ' + (e.reason && e.reason.message ? e.reason.message : e.reason)));
+log('Módulo cargado correctamente.');
 
 /* ---------------------------------------------------------------------
    1) THREE.JS + WEBXR
@@ -132,6 +173,7 @@ scene.add(reticle);
 let hitTestSource = null;
 let hitTestSourceRequested = false;
 let localSpace = null;
+let latestHitTestResult = null; // último resultado de hit-test, se usa para crear el anchor al tocar
 
 /* ---------------------------------------------------------------------
    2) WEB AUDIO: contexto, listener, y buffers de las dos capas de sonido
@@ -147,6 +189,7 @@ let ambientNoiseBuffer = null; // fallback generado si no hay BACKGROUND_SOUND_U
 
 async function loadAudioBuffer(url) {
   const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status} al pedir ${url}`);
   const arr = await res.arrayBuffer();
   return audioCtx.decodeAudioData(arr);
 }
@@ -168,8 +211,23 @@ function createAmbientNoiseBuffer(durationSec = 2) {
 
 async function preloadBuffers() {
   ambientNoiseBuffer = createAmbientNoiseBuffer();
-  if (PRIMARY_SOUND_URL) primaryBuffer = await loadAudioBuffer(PRIMARY_SOUND_URL);
-  if (BACKGROUND_SOUND_URL) backgroundBuffer = await loadAudioBuffer(BACKGROUND_SOUND_URL);
+
+  if (PRIMARY_SOUND_URL) {
+    try {
+      primaryBuffer = await loadAudioBuffer(PRIMARY_SOUND_URL);
+      log('✓ Audio principal cargado: ' + PRIMARY_SOUND_URL);
+    } catch (err) {
+      log('✗ No se pudo cargar el audio principal (' + PRIMARY_SOUND_URL + '): ' + err.message + '. Se usará un tono de reemplazo.');
+    }
+  }
+  if (BACKGROUND_SOUND_URL) {
+    try {
+      backgroundBuffer = await loadAudioBuffer(BACKGROUND_SOUND_URL);
+      log('✓ Audio de fondo cargado: ' + BACKGROUND_SOUND_URL);
+    } catch (err) {
+      log('✗ No se pudo cargar el audio de fondo (' + BACKGROUND_SOUND_URL + '): ' + err.message + '. Se usará un ruido de reemplazo.');
+    }
+  }
 }
 
 const placedSounds = []; // { primaryGain, backgroundGain, nodes:[...], mesh, id }
@@ -186,7 +244,7 @@ function setPannerPosition(panner, pos) {
   }
 }
 
-function addSoundSource(position) {
+function addSoundSource(position, anchor) {
   const id = nextId++;
   const nodesToStop = [];
 
@@ -194,12 +252,20 @@ function addSoundSource(position) {
   const panner = audioCtx.createPanner();
   panner.panningModel = 'HRTF';
   panner.distanceModel = 'inverse';
-  panner.refDistance = 0.6;
+  panner.refDistance = 0.3;   // qué tan cerca hay que estar para el volumen "máximo" (bajo = caída más marcada en salas chicas)
   panner.maxDistance = 15;
-  panner.rolloffFactor = 1.4;
+  panner.rolloffFactor = 2.5; // qué tan rápido baja el volumen con la distancia
   panner.coneInnerAngle = 360;
   setPannerPosition(panner, position);
-  panner.connect(masterGain);
+
+  // Segunda pista de distancia, además del volumen: amortigua los agudos a medida que
+  // el usuario se aleja, imitando cómo el aire y las superficies atenúan más las
+  // frecuencias altas con la distancia. El oído nota este cambio de timbre incluso
+  // cuando el cambio de volumen por sí solo pasa desapercibido.
+  const distanceFilter = audioCtx.createBiquadFilter();
+  distanceFilter.type = 'lowpass';
+  distanceFilter.frequency.value = 18000; // "brillante" cuando está cerca
+  panner.connect(distanceFilter).connect(masterGain);
 
   // --- Capa principal ---
   const primaryGain = audioCtx.createGain();
@@ -252,7 +318,7 @@ function addSoundSource(position) {
   mesh.position.copy(position);
   scene.add(mesh);
 
-  const entry = { id, primaryGain, backgroundGain, nodesToStop, mesh };
+  const entry = { id, primaryGain, backgroundGain, nodesToStop, mesh, anchor, distanceFilter };
   placedSounds.push(entry);
   renderSoundPanel();
 }
@@ -262,6 +328,7 @@ function removeSoundSource(id) {
   if (idx === -1) return;
   const entry = placedSounds[idx];
   entry.nodesToStop.forEach(n => { try { n.stop(); } catch (e) {} });
+  if (entry.anchor && entry.anchor.delete) { try { entry.anchor.delete(); } catch (e) {} }
   scene.remove(entry.mesh);
   placedSounds.splice(idx, 1);
   renderSoundPanel();
@@ -312,23 +379,52 @@ function renderSoundPanel() {
   document.getElementById('count').textContent = placedSounds.length;
 }
 
-function updateListener() {
+// Ajustá estas distancias al tamaño real de tu sala si hace falta
+const FILTER_NEAR_DIST = 0.5; // a esta distancia o menos, suena "brillante" (sin filtrar)
+const FILTER_FAR_DIST = 4.0;  // a esta distancia, ya suena bastante "apagado"
+const FILTER_MIN_FREQ = 500;
+const FILTER_MAX_FREQ = 18000;
+
+function updateSpatialAudio(frame) {
   const xrCam = renderer.xr.getCamera(camera);
   xrCam.updateMatrixWorld();
-  const pos = new THREE.Vector3().setFromMatrixPosition(xrCam.matrixWorld);
+  const listenerPos = new THREE.Vector3().setFromMatrixPosition(xrCam.matrixWorld);
   const quat = new THREE.Quaternion().setFromRotationMatrix(xrCam.matrixWorld);
   const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(quat);
   const up = new THREE.Vector3(0, 1, 0).applyQuaternion(quat);
 
   const listener = audioCtx.listener;
   if (listener.positionX) {
-    listener.positionX.value = pos.x; listener.positionY.value = pos.y; listener.positionZ.value = pos.z;
+    listener.positionX.value = listenerPos.x; listener.positionY.value = listenerPos.y; listener.positionZ.value = listenerPos.z;
     listener.forwardX.value = forward.x; listener.forwardY.value = forward.y; listener.forwardZ.value = forward.z;
     listener.upX.value = up.x; listener.upY.value = up.y; listener.upZ.value = up.z;
   } else {
-    listener.setPosition(pos.x, pos.y, pos.z);
+    listener.setPosition(listenerPos.x, listenerPos.y, listenerPos.z);
     listener.setOrientation(forward.x, forward.y, forward.z, up.x, up.y, up.z);
   }
+
+  placedSounds.forEach(entry => {
+    // Si la fuente tiene un anchor real de WebXR, seguimos su pose corregida cada cuadro:
+    // si ARCore refina su estimación del espacio mientras caminás, el sonido y el
+    // marcador se mueven junto con esa corrección en vez de quedar "pegados" a una
+    // posición vieja — esto es lo que causaba el desfasaje que notaste al moverte.
+    if (frame && entry.anchor) {
+      const pose = frame.getPose(entry.anchor.anchorSpace, localSpace);
+      if (pose) {
+        const m = new THREE.Matrix4().fromArray(pose.transform.matrix);
+        const p = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
+        m.decompose(p, q, s);
+        entry.mesh.position.copy(p);
+        entry.mesh.quaternion.copy(q);
+        setPannerPosition(entry.panner, p);
+      }
+    }
+
+    const dist = listenerPos.distanceTo(entry.mesh.position);
+    const t = THREE.MathUtils.clamp((dist - FILTER_NEAR_DIST) / (FILTER_FAR_DIST - FILTER_NEAR_DIST), 0, 1);
+    const freq = THREE.MathUtils.lerp(FILTER_MAX_FREQ, FILTER_MIN_FREQ, t);
+    entry.distanceFilter.frequency.setTargetAtTime(freq, audioCtx.currentTime, 0.15);
+  });
 }
 
 /* ---------------------------------------------------------------------
@@ -336,23 +432,26 @@ function updateListener() {
    --------------------------------------------------------------------- */
 const supportMsg = document.getElementById('supportMsg');
 
+log('Comprobando navigator.xr…');
 if (navigator.xr) {
   navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
+    log('isSessionSupported(immersive-ar) = ' + supported);
     if (supported) {
       supportMsg.textContent = 'Listo. Usá auriculares para escuchar el efecto 3D del audio.';
       buildARButton();
     } else {
       supportMsg.textContent = 'Este dispositivo/navegador no soporta AR inmersiva (immersive-ar). Probá con Chrome en un Android compatible con ARCore.';
     }
-  });
+  }).catch(err => log('Error en isSessionSupported: ' + err.message));
 } else {
   supportMsg.textContent = 'WebXR no está disponible en este navegador. Probá con Chrome en Android.';
+  log('navigator.xr no existe en este navegador.');
 }
 
 function buildARButton() {
   const btn = ARButton.createButton(renderer, {
     requiredFeatures: ['hit-test'],
-    optionalFeatures: ['dom-overlay', 'local-floor'],
+    optionalFeatures: ['dom-overlay', 'local-floor', 'anchors'],
     domOverlay: { root: document.body }
   });
   document.getElementById('arBtnContainer').appendChild(btn);
@@ -381,11 +480,20 @@ renderer.xr.addEventListener('sessionend', () => {
 });
 
 const controller = renderer.xr.getController(0);
-controller.addEventListener('select', () => {
-  if (reticle.visible) {
-    const pos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
-    addSoundSource(pos);
+controller.addEventListener('select', async () => {
+  if (!reticle.visible) return;
+  const pos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+
+  if (latestHitTestResult && latestHitTestResult.createAnchor) {
+    try {
+      const anchor = await latestHitTestResult.createAnchor();
+      addSoundSource(pos, anchor);
+      return;
+    } catch (err) {
+      log('No se pudo crear un anchor persistente (' + err.message + '); se usa una posición fija.');
+    }
   }
+  addSoundSource(pos, null); // sin anchors: la posición no se auto-corrige con el tiempo
 });
 scene.add(controller);
 
@@ -396,14 +504,16 @@ renderer.setAnimationLoop((timestamp, frame) => {
   if (frame && hitTestSourceRequested && hitTestSource) {
     const hitTestResults = frame.getHitTestResults(hitTestSource);
     if (hitTestResults.length > 0) {
-      const pose = hitTestResults[0].getPose(localSpace);
+      latestHitTestResult = hitTestResults[0];
+      const pose = latestHitTestResult.getPose(localSpace);
       reticle.visible = true;
       reticle.matrix.fromArray(pose.transform.matrix);
     } else {
+      latestHitTestResult = null;
       reticle.visible = false;
     }
   }
-  if (frame) updateListener();
+  if (frame) updateSpatialAudio(frame);
   renderer.render(scene, camera);
 });
 
