@@ -134,11 +134,16 @@ import { ARButton } from 'three/addons/webxr/ARButton.js';
       Si las dejás en null, se usa un sonido generado (tono + ruido filtrado)
       para que el prototipo funcione sin necesitar archivos.
    --------------------------------------------------------------------- */
-const PRIMARY_SOUND_URL = 'audio.mp3';    // ej: './audio.mp3'
-const BACKGROUND_SOUND_URL = 'Aymara.mp3'; // ej: './Aymara.mp3'  (respetá mayúsculas/minúsculas exactas del archivo)
+const PRIMARY_SOUND_URL = 'audio.mp3';    // ej: 
+const BACKGROUND_SOUND_URL = 'Aymara.mp3'; // ej:   (respetá mayúsculas/minúsculas exactas del archivo)
 
 // Log visible en pantalla (además de en la consola) para depurar sin herramientas extra.
+let _lastLogMsg = '';
+let _lastLogTime = 0;
 function log(msg) {
+  const now = performance.now();
+  if (msg === _lastLogMsg && now - _lastLogTime < 2000) return; // evita saturar si se repite cada cuadro
+  _lastLogMsg = msg; _lastLogTime = now;
   console.log(msg);
   const el = document.getElementById('debugLog'); // visible en la pantalla de inicio, antes de entrar en AR
   if (el) el.textContent += msg + '\n';
@@ -409,14 +414,20 @@ function updateSpatialAudio(frame) {
     // marcador se mueven junto con esa corrección en vez de quedar "pegados" a una
     // posición vieja — esto es lo que causaba el desfasaje que notaste al moverte.
     if (frame && entry.anchor) {
-      const pose = frame.getPose(entry.anchor.anchorSpace, localSpace);
-      if (pose) {
-        const m = new THREE.Matrix4().fromArray(pose.transform.matrix);
-        const p = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
-        m.decompose(p, q, s);
-        entry.mesh.position.copy(p);
-        entry.mesh.quaternion.copy(q);
-        setPannerPosition(entry.panner, p);
+      try {
+        const pose = frame.getPose(entry.anchor.anchorSpace, localSpace);
+        if (pose) {
+          const m = new THREE.Matrix4().fromArray(pose.transform.matrix);
+          const p = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
+          m.decompose(p, q, s);
+          entry.mesh.position.copy(p);
+          entry.mesh.quaternion.copy(q);
+          setPannerPosition(entry.panner, p);
+        }
+      } catch (err) {
+        // El anchor puede tardar uno o dos cuadros en quedar disponible justo después de
+        // crearse (o perderse si el usuario sale del área trackeada) — se ignora y se
+        // reintenta solo en el próximo cuadro, en vez de romper el resto del render.
       }
     }
 
@@ -501,19 +512,26 @@ scene.add(controller);
    4) BUCLE DE RENDER
    --------------------------------------------------------------------- */
 renderer.setAnimationLoop((timestamp, frame) => {
-  if (frame && hitTestSourceRequested && hitTestSource) {
-    const hitTestResults = frame.getHitTestResults(hitTestSource);
-    if (hitTestResults.length > 0) {
-      latestHitTestResult = hitTestResults[0];
-      const pose = latestHitTestResult.getPose(localSpace);
-      reticle.visible = true;
-      reticle.matrix.fromArray(pose.transform.matrix);
-    } else {
-      latestHitTestResult = null;
-      reticle.visible = false;
+  try {
+    if (frame && hitTestSourceRequested && hitTestSource) {
+      const hitTestResults = frame.getHitTestResults(hitTestSource);
+      if (hitTestResults.length > 0) {
+        latestHitTestResult = hitTestResults[0];
+        const pose = latestHitTestResult.getPose(localSpace);
+        reticle.visible = true;
+        reticle.matrix.fromArray(pose.transform.matrix);
+      } else {
+        latestHitTestResult = null;
+        reticle.visible = false;
+      }
     }
+    if (frame) updateSpatialAudio(frame);
+  } catch (err) {
+    // Red de seguridad: cualquier error inesperado acá se muestra en pantalla, pero
+    // NUNCA debe impedir que se siga dibujando el cuadro (ver el render() más abajo,
+    // fuera del try) — así la app nunca se queda "congelada" en silencio.
+    log('Error en el bucle de render: ' + err.message);
   }
-  if (frame) updateSpatialAudio(frame);
   renderer.render(scene, camera);
 });
 
